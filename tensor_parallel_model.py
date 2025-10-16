@@ -1,10 +1,10 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+Simulation of a tensor-parallel GPT model in PyTorch.
+The architecture of the model is an imitation of a transformer in a tensor-parallel setting,
+but it does not actually implement any distributed communication or parallelism like pytorch.distributed
+This is just a single-GPU model that is structured in a way that is similar to how a tensor-parallel
+model would be structured, for the purpose of studying and understanding tensor parallelism.
+The imitation simulates the split-compute-and-sync pattern within a single process.
 """
 
 import math
@@ -15,98 +15,48 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+from model import LayerNorm
 
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+class f_op(torch.autograd.Function):
+    """
+    Forward: Return TP_SIZE copies stacked as a tensor (simulating broadcast to all ranks)
+    Backward: Sum all incoming gradients along the TP dimension (simulating All-Reduce)
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, tp_size: int):
+        ctx.tp_size = tp_size
+        # Stack TP_SIZE copies along a new dimension (dim=0)
+        # Shape: [tp_size, batch, seq, hidden]
+        return x.unsqueeze(0).expand(tp_size, *x.shape).contiguous()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # grad_output shape: [tp_size, batch, seq, hidden]
+        # All-Reduce: sum along the TP dimension
+        grad_input = grad_output.sum(dim=0)
+        return grad_input, None
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+class g_op(torch.autograd.Function):
+    """
+    Forward: Sum inputs along TP dimension (simulating All-Reduce)
+    Backward: Replicate gradient to all ranks (broadcast)
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor):
+        # x shape: [tp_size, batch, seq, hidden]
+        ctx.tp_size = x.shape[0]
+        # All-Reduce in forward: sum along TP dimension
+        return x.sum(dim=0)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # grad_output shape: [batch, seq, hidden]
+        # Broadcast: replicate gradient for all TP ranks
+        # Shape: [tp_size, batch, seq, hidden]
+        return grad_output.unsqueeze(0).expand(ctx.tp_size, *grad_output.shape).contiguous()
 
 @dataclass
-class GPTConfig:
+class DistributedGPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -114,8 +64,147 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    TP_SIZE = 2 # num of TP partitions
 
-class GPT(nn.Module):
+class MLP_TP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.TP_SIZE = config.TP_SIZE
+        c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_fc.weight.data, config.TP_SIZE, dim=0))
+        if config.bias:
+            self.c_fc_biases = nn.ParameterList(nn.Parameter(b) for b in torch.chunk(c_fc.bias.data, config.TP_SIZE, dim=0))
+        else:
+            self.c_fc_biases = [None] * config.TP_SIZE
+        del c_fc
+        c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_proj.weight.data, config.TP_SIZE, dim=1))
+        self.c_proj_bias = nn.Parameter(c_proj.bias.data) if config.bias else None
+        del c_proj
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        # --- 1. Column Parallel (c_fc) + All-Gather ---
+        x_rep = f_op.apply(x, self.TP_SIZE)
+        z = []
+        for i in range(self.TP_SIZE):
+            y_i = F.linear(x_rep[i], self.c_fc_weights[i], self.c_fc_biases[i])
+            z_i = self.gelu(y_i)
+            z_i = F.linear(z_i, self.c_proj_weights[i], None)
+            z.append(z_i)
+        z = g_op.apply(torch.stack(z, dim=0)) # Simulate All-Gather/
+        # Add the bias after the All-Gather
+        if self.c_proj_bias is not None:
+            z += self.c_proj_bias 
+        return self.dropout(z)
+    
+class CausalSelfAttention_TP(nn.Module):
+    """ 
+    TP version of CausalSelfAttention.
+    c_attn: Column Parallel (Split Output, All-Gather/Cat in forward)
+    c_proj: Row Parallel (Split Input, All-Reduce/Sum in forward)
+    """
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.TP_SIZE = config.TP_SIZE
+
+        # 1. c_attn (COLUMNS PARALLEL): Split along the OUTPUT dimension (3*n_embd)
+        c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_attn.weight.data, self.TP_SIZE, dim=0))
+        if config.bias:
+            self.c_attn_biases = nn.ParameterList(nn.Parameter(b) for b in torch.chunk(c_attn.bias.data, self.TP_SIZE, dim=0))
+        else:
+            self.c_attn_biases = [None] * self.TP_SIZE
+        del c_attn
+        
+        # 2. c_proj (ROW PARALLEL): Split along the INPUT dimension (n_embd)
+        c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_proj.weight.data, self.TP_SIZE, dim=1))
+        self.c_proj_bias = nn.Parameter(c_proj.bias.data) if config.bias else None
+        del c_proj
+
+        # 3. Non-parallel components (standard)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # Causal mask registration
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        # --- 1. Column Parallel (c_attn) ---
+        # Apply f operator: broadcast in forward, all-reduce (sum) in backward
+        # x shape: [B, T, C] -> [TP, B, T, C]
+        x_replicated = f_op.apply(x, self.TP_SIZE)
+        
+        # Process each TP rank to get QKV partitions
+        z_list = []
+        for i in range(self.TP_SIZE):
+            qkv_i = F.linear(x_replicated[i], self.c_attn_weights[i], self.c_attn_biases[i])
+            q_i, k_i, v_i = qkv_i.split(self.n_embd // self.TP_SIZE, dim=2)
+            
+            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+            dim_per_worker = C // (self.TP_SIZE * self.n_head)
+            k_i = k_i.view(B, T, self.n_head, dim_per_worker).transpose(1, 2)
+            q_i = q_i.view(B, T, self.n_head, dim_per_worker).transpose(1, 2)
+            v_i = v_i.view(B, T, self.n_head, dim_per_worker).transpose(1, 2)
+
+            # Each rank independently computes attention for its heads
+            if self.flash:
+                y_i = F.scaled_dot_product_attention(
+                    q_i, k_i, v_i, attn_mask=None, 
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=True
+                )
+            else:
+                att_i = (q_i @ k_i.transpose(-2, -1)) * (1.0 / math.sqrt(k_i.size(-1)))
+                att_i = att_i.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att_i = F.softmax(att_i, dim=-1)
+                att_i = self.attn_dropout(att_i)
+                y_i = att_i @ v_i
+
+            # Reshape back
+            y_i = y_i.transpose(1, 2).contiguous().view(B, T, self.n_embd // self.TP_SIZE)
+
+            # --- 2. Row Parallel (c_proj) ---
+            # Each rank processes its partition through c_proj
+            z_i = F.linear(y_i, self.c_proj_weights[i], None)
+            z_list.append(z_i)
+    
+        # Stack and apply g operator: all-reduce (sum) in forward, broadcast in backward
+        z = g_op.apply(torch.stack(z_list, dim=0))  # [B, T, C]
+
+        # Add the bias AFTER the All-Reduce
+        if self.c_proj_bias is not None:
+            z += self.c_proj_bias
+
+        return self.resid_dropout(z)
+
+class TP_Block(nn.Module):
+    """ The Simulated Tensor Parallel Transformer Block """
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention_TP(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP_TP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+class DistributedGPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -127,7 +216,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([TP_Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -328,14 +417,22 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-    
+
+
 if __name__ == '__main__':
     bsz = 1
-    cfg = GPTConfig()
+    cfg = DistributedGPTConfig()
     print(cfg)
-    model = GPT(cfg)
-    x = torch.randint(cfg.vocab_size, (bsz, cfg.block_size), dtype=torch.long)
-    logits, loss = model(x, targets=x)
-    print("logits.shape:", logits.shape)
+    mlp = MLP_TP(cfg)
+    x = torch.randn(bsz, cfg.block_size, cfg.n_embd)
+    y = mlp(x)
+    loss = F.mse_loss(y, x)
     print("loss:", loss.item())
+    loss.backward()
+    print("all good")
+    attn = CausalSelfAttention_TP(cfg)
+    y = attn(x)
+    loss = F.mse_loss(y, x)
+    print("loss:", loss.item())
+    loss.backward()
     print("all good")
