@@ -110,8 +110,13 @@ class CausalSelfAttention_TP(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.TP_SIZE = config.TP_SIZE
-
-        # 1. c_attn (COLUMNS PARALLEL): Split along the OUTPUT dimension (3*n_embd)
+        assert config.n_head % config.TP_SIZE == 0, "n_head must be divisible by TP_SIZE"
+        self.heads_per_worker = config.n_head // config.TP_SIZE
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        
+        # 1. c_attn (COLUMNS PARALLEL)
         c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_attn_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_attn.weight.data, self.TP_SIZE, dim=0))
         if config.bias:
@@ -129,9 +134,7 @@ class CausalSelfAttention_TP(nn.Module):
         # 3. Non-parallel components (standard)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
+
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -154,10 +157,10 @@ class CausalSelfAttention_TP(nn.Module):
             q_i, k_i, v_i = qkv_i.split(self.n_embd // self.TP_SIZE, dim=2)
             
             # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-            dim_per_worker = C // (self.TP_SIZE * self.n_head)
-            k_i = k_i.view(B, T, self.n_head, dim_per_worker).transpose(1, 2)
-            q_i = q_i.view(B, T, self.n_head, dim_per_worker).transpose(1, 2)
-            v_i = v_i.view(B, T, self.n_head, dim_per_worker).transpose(1, 2)
+            dim_per_worker = C //  self.n_head
+            k_i = k_i.view(B, T, self.heads_per_worker, dim_per_worker).transpose(1, 2)
+            q_i = q_i.view(B, T, self.heads_per_worker, dim_per_worker).transpose(1, 2)
+            v_i = v_i.view(B, T, self.heads_per_worker, dim_per_worker).transpose(1, 2)
 
             # Each rank independently computes attention for its heads
             if self.flash:
@@ -174,10 +177,10 @@ class CausalSelfAttention_TP(nn.Module):
                 y_i = att_i @ v_i
 
             # Reshape back
-            y_i = y_i.transpose(1, 2).contiguous().view(B, T, self.n_embd // self.TP_SIZE)
+            y_i = y_i.transpose(1, 2).contiguous().view(B, T, C // self.TP_SIZE)
 
             # --- 2. Row Parallel (c_proj) ---
-            # Each rank processes its partition through c_proj
+            # Each worker processes its heads through c_proj
             z_i = F.linear(y_i, self.c_proj_weights[i], None)
             z_list.append(z_i)
     
@@ -198,6 +201,67 @@ class TP_Block(nn.Module):
         self.attn = CausalSelfAttention_TP(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP_TP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+class SPD_Block(nn.Module):
+    """ The Simulated Tensor Parallel Transformer Block """
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.TP_SIZE == 0, "n_embd must be divisible by TP_SIZE"
+        self.ln_1 = nn.ModuleList(LayerNorm(config.n_embd // self.TP_SIZE, bias=config.bias) for _ in range(config.TP_SIZE))
+        self.ln_2 = nn.ModuleList(LayerNorm(config.n_embd // self.TP_SIZE, bias=config.bias) for _ in range(config.TP_SIZE))
+
+        # Attention
+        assert config.n_embd % config.n_head == 0
+        self.TP_SIZE = config.TP_SIZE
+
+        # 1. c_attn (COLUMNS PARALLEL): Split along the OUTPUT dimension (3*n_embd)
+        c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_attn.weight.data, self.TP_SIZE, dim=0))
+        if config.bias:
+            self.c_attn_biases = nn.ParameterList(nn.Parameter(b) for b in torch.chunk(c_attn.bias.data, self.TP_SIZE, dim=0))
+        else:
+            self.c_attn_biases = [None] * self.TP_SIZE
+        del c_attn
+        
+        # 2. c_proj (ROW PARALLEL): Split along the INPUT dimension (n_embd)
+        c_proj_attn = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj_attn_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_proj_attn.weight.data, self.TP_SIZE, dim=1))
+        self.c_proj_attn_bias = nn.Parameter(c_proj_attn.bias.data) if config.bias else None
+        del c_proj_attn
+
+        # 3. Non-parallel components (standard)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # Causal mask registration
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+        
+        # MLP
+        c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_fc.weight.data, config.TP_SIZE, dim=0))
+        if config.bias:
+            self.c_fc_biases = nn.ParameterList(nn.Parameter(b) for b in torch.chunk(c_fc.bias.data, config.TP_SIZE, dim=0))
+        else:
+            self.c_fc_biases = [None] * config.TP_SIZE
+        del c_fc
+        c_proj_mlp  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj_mlp_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_proj_mlp.weight.data, config.TP_SIZE, dim=1))
+        self.c_proj_mlp_bias = nn.Parameter(c_proj_mlp.bias.data) if config.bias else None
+        del c_proj_mlp
+
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -317,8 +381,8 @@ class DistributedGPT(nn.Module):
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
+        config = DistributedGPTConfig(**config_args)
+        model = DistributedGPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
