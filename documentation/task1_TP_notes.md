@@ -1,6 +1,6 @@
 # Take-home exercise results
 
-## Understanding tensor parallelism bottleneck in communication
+## Task 1 : Understanding tensor parallelism bottleneck in communication
 
 The following figure from the Megatron-LM paper illustrates the communication bottleneck in tensor parallelism for a transformer layer:
 ![alt text](communication_steps.png)
