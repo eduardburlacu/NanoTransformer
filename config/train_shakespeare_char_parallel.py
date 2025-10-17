@@ -2,7 +2,7 @@
 # same as train_shakespeare_char.py but with Parallel communication strategy
 
 out_dir = 'out-shakespeare-char-parallel'
-eval_interval = 250
+eval_interval = 10
 eval_iters = 200
 log_interval = 10
 

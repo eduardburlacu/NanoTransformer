@@ -447,7 +447,7 @@ class Parallel_Block(nn.Module):
 
         if self.last_block:
             z = g_op.apply(torch.stack(z_list, dim=0)) # Simulate All-Gather/
-            return x + z
+            return x.mean(0) + z
         
         # Not last block: keep expanded form
         return x_rep + torch.stack(z_list, dim=0)
@@ -715,8 +715,12 @@ if __name__ == '__main__':
     loss.backward()
     print("all good")
     x = torch.randn(bsz, cfg.block_size, cfg.n_embd)
-    parallel = Parallel_Block(cfg, first_block=True, last_block=True)
-    y = parallel(x)
+    parallel_first = Parallel_Block(cfg, first_block=True, last_block=False)
+    parallel_mid = Parallel_Block(cfg, first_block=False, last_block=False)
+    parallel_last = Parallel_Block(cfg, first_block=False, last_block=True)
+    y = parallel_first(x)
+    y = parallel_mid(y)
+    y = parallel_last(y)
     loss = F.mse_loss(y, x)
     print("loss:", loss.item())
     loss.backward()
