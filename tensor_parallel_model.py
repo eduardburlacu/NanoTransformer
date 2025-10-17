@@ -67,7 +67,9 @@ class DistributedGPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    TP_SIZE = 2 # num of TP partitions
+    TP_SIZE: int = 2 # num of TP partitions
+    block_types: list = None  # List of block types for each layer: 'tp', 'spd', or 'parallel'
+    # If None, defaults to all 'tp' blocks
 
 class MLP_TP(nn.Module):
 
@@ -457,11 +459,35 @@ class DistributedGPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # Determine block types for each layer
+        if config.block_types is None:
+            # Default: all TP blocks
+            block_types = ['tp'] * config.n_layer
+        else:
+            assert len(config.block_types) == config.n_layer, \
+                f"block_types length ({len(config.block_types)}) must match n_layer ({config.n_layer})"
+            block_types = config.block_types
+        
+        # Build the transformer blocks based on specified types
+        blocks = []
+        for i, block_type in enumerate(block_types):
+            if block_type == 'tp':
+                blocks.append(TP_Block(config))
+            elif block_type == 'spd':
+                blocks.append(SPD_Block(config))
+            elif block_type == 'parallel':
+                # Determine if this is first or last block for Parallel_Block
+                is_first = (i == 0) or (i > 0 and block_types[i-1] != 'parallel')
+                is_last = (i == config.n_layer - 1) or (i < config.n_layer - 1 and block_types[i+1] != 'parallel')
+                blocks.append(Parallel_Block(config, first_block=is_first, last_block=is_last))
+            else:
+                raise ValueError(f"Unknown block type: {block_type}. Must be 'tp', 'spd', or 'parallel'")
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([TP_Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList(blocks),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -693,4 +719,9 @@ if __name__ == '__main__':
     loss = F.mse_loss(y, x)
     print("loss:", loss.item())
     loss.backward()
+    print("all good")
+
+    transformer = DistributedGPT(cfg)
+    ids = torch.randint(0, cfg.vocab_size, (bsz, cfg.block_size))
+    y = transformer(ids)[0]
     print("all good")
