@@ -7,13 +7,18 @@ import numpy as np
 import time
 import torch
 from model import GPTConfig, GPT
+from tensor_parallel_model import DistributedGPTConfig, DistributedGPT
 
 # -----------------------------------------------------------------------------
+model_type = 'gpt'  # 'gpt' for standard GPT, 'distributed_gpt' for DistributedGPT
 batch_size = 12
 block_size = 1024
 bias = False
 real_data = True
 seed = 1337
+# DistributedGPT specific settings
+tp_size = 2  # Tensor parallel size (only used if model_type='distributed_gpt')
+block_types = None  # List of block types: 'tp', 'spd', 'parallel', or None for all 'tp'
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
@@ -48,13 +53,27 @@ else:
     get_batch = lambda split: (x, y)
 
 # model init
-gptconf = GPTConfig(
-    block_size = block_size, # how far back does the model look? i.e. context size
-    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
-    dropout = 0, # for determinism
-    bias = bias,
-)
-model = GPT(gptconf)
+if model_type == 'gpt':
+    gptconf = GPTConfig(
+        block_size = block_size, # how far back does the model look? i.e. context size
+        n_layer = 12, n_head = 12, n_embd = 768, # size of the model
+        dropout = 0, # for determinism
+        bias = bias,
+    )
+    model = GPT(gptconf)
+elif model_type == 'distributed_gpt':
+    gptconf = DistributedGPTConfig(
+        block_size = block_size,
+        n_layer = 12, n_head = 12, n_embd = 768,
+        dropout = 0,
+        bias = bias,
+        TP_SIZE = tp_size,
+        block_types = block_types,
+    )
+    model = DistributedGPT(gptconf)
+else:
+    raise ValueError(f"Unknown model_type: {model_type}")
+
 model.to(device)
 
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)

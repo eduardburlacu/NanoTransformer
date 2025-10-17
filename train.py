@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from tensor_parallel_model import DistributedGPTConfig, DistributedGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -49,11 +50,15 @@ gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
+model_type = 'gpt'  # 'gpt' for standard GPT, 'distributed_gpt' for DistributedGPT
 n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# DistributedGPT specific settings
+tp_size = 2  # Tensor parallel size (only used if model_type='distributed_gpt')
+block_types = None  # List of block types: 'tp', 'spd', 'parallel', or None for all 'tp'
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -146,6 +151,11 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+
+if model_type == 'distributed_gpt':
+    model_args['TP_SIZE'] = tp_size
+    model_args['block_types'] = block_types
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -153,8 +163,15 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    
+    if model_type == 'gpt':
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    elif model_type == 'distributed_gpt':
+        gptconf = DistributedGPTConfig(**model_args)
+        model = DistributedGPT(gptconf)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -165,9 +182,21 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    # Restore model type and distributed settings if present
+    if 'TP_SIZE' in checkpoint_model_args:
+        model_args['TP_SIZE'] = checkpoint_model_args['TP_SIZE']
+        model_args['block_types'] = checkpoint_model_args.get('block_types', None)
+        model_type = 'distributed_gpt'
+    
     # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    if model_type == 'gpt':
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    elif model_type == 'distributed_gpt':
+        gptconf = DistributedGPTConfig(**model_args)
+        model = DistributedGPT(gptconf)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more

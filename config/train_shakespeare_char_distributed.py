@@ -1,7 +1,7 @@
-# train a miniature character-level shakespeare model
-# good for debugging and playing on macbooks and such
+# train a DistributedGPT character-level shakespeare model
+# same as train_shakespeare_char.py but with DistributedGPT
 
-out_dir = 'out-shakespeare-char'
+out_dir = 'out-shakespeare-char-distributed'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -31,6 +31,11 @@ min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
 warmup_iters = 100 # not super necessary potentially
+
+# DistributedGPT specific
+model_type = 'distributed_gpt'
+tp_size = 2  # Tensor parallel size
+block_types = None  # None = all TP blocks. Try: ['spd']*6 or ['parallel']*6
 
 # on macbook also add
 device = 'cpu'  # run on cpu only
