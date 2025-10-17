@@ -309,13 +309,13 @@ class SPD_Block(nn.Module):
         p_i = p_i.transpose(1, 2).contiguous().view(B, T, C // self.TP_SIZE)
         p_i = F.linear(p_i, self.c_proj_attn_weights[i], None)
         y_i = p_i + self.c_proj_attn_bias if self.c_proj_attn_bias is not None else p_i
-        y_i += x
+        y_i = self.resid_dropout(y_i) + x
         
         # MLP
         z_i = F.linear(self.ln_2(y_i), self.c_fc_weights[i], self.c_fc_biases[i])
         z_i = F.gelu(z_i)
         z_i = F.linear(z_i, self.c_proj_mlp_weights[i], None)
-        z_i += p_i
+        z_i = self.dropout_mlp(z_i) + p_i
         return z_i
     
     def forward(self, x):
@@ -426,13 +426,13 @@ class Parallel_Block(nn.Module):
         p_i = p_i.transpose(1, 2).contiguous().view(B, T, C // self.TP_SIZE)
         p_i = F.linear(p_i, self.c_proj_attn_weights[i], None)
         y_i = p_i + self.c_proj_attn_bias if self.c_proj_attn_bias is not None else p_i
-        y_i += x
+        y_i = self.resid_dropout(y_i) + x
         
         # MLP
         z_i = F.linear(self.ln_2(y_i), self.c_fc_weights[i], self.c_fc_biases[i])
         z_i = F.gelu(z_i)
         z_i = F.linear(z_i, self.c_proj_mlp_weights[i], None)
-        z_i += p_i
+        z_i = self.dropout_mlp(z_i) + p_i
         return z_i
     
     def forward(self, x):
