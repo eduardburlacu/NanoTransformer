@@ -435,22 +435,20 @@ class Parallel_Block(nn.Module):
     
     def forward(self, x):
         if self.first_block:
-            x = f_op.apply(x, self.TP_SIZE)
+            x_rep = f_op.apply(x, self.TP_SIZE)
         
-        TP, B, T, C = x.size()
+        TP, _, _, _ = x_rep.size()
         assert TP == self.TP_SIZE
         z_list = []
         for i in range(self.TP_SIZE):
-            z_list.append(self.forward_worker(x[i], i))
+            z_list.append(self.forward_worker(x_rep[i], i))
 
         if self.last_block:
             z = g_op.apply(torch.stack(z_list, dim=0)) # Simulate All-Gather/
-            return x[0] + z
+            return x + z
         
-        return x + torch.stack(z_list, dim=0)
+        return x_rep + torch.stack(z_list, dim=0)
         
-
-
 class DistributedGPT(nn.Module):
 
     def __init__(self, config):
