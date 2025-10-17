@@ -2,7 +2,7 @@
 # same as train_shakespeare_char.py but with SPD communication strategy
 
 out_dir = 'out-shakespeare-char-spd'
-eval_interval = 250
+eval_interval = 10
 eval_iters = 200
 log_interval = 10
 
@@ -10,7 +10,7 @@ always_save_checkpoint = False
 
 wandb_log = True # WandB logging enabled
 wandb_project = 'shakespeare-char'
-wandb_run_name = 'distributed-gpt-spd'
+wandb_run_name = 'distributed--mini-gpt-spd'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
@@ -34,5 +34,5 @@ warmup_iters = 100
 # DistributedGPT specific
 model_type = 'distributed_gpt'
 tp_size = 2
-block_types = ['spd'] * 6  # SPD blocks for reduced communication
+block_types = ['spd'] * 4  # SPD blocks for reduced communication
 compile = False

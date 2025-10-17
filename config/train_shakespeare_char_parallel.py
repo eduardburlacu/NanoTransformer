@@ -10,7 +10,7 @@ always_save_checkpoint = False
 
 wandb_log = True # WandB logging enabled
 wandb_project = 'shakespeare-char'
-wandb_run_name = 'distributed-gpt-parallel'
+wandb_run_name = 'distributed-mini-gpt-parallel'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
@@ -34,5 +34,5 @@ warmup_iters = 100
 # DistributedGPT specific
 model_type = 'distributed_gpt'
 tp_size = 2
-block_types = ['parallel'] * 6  # Parallel blocks for minimal communication
+block_types = ['parallel'] * 4  # Parallel blocks for minimal communication
 compile = False

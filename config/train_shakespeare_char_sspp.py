@@ -1,17 +1,17 @@
-# train a miniature character-level shakespeare model
-# good for debugging and playing on macbooks and such
+# train a DistributedGPT character-level shakespeare model
+# same as train_shakespeare_char.py but with DistributedGPT
 
-out_dir = 'out-shakespeare-char'
-eval_interval = 10 # evaluate every 10 steps to see train and val loss frequently
+out_dir = 'out-shakespeare-char-distributed-sspp'
+eval_interval = 10 # keep frequent because we'll overfit
 eval_iters = 200
-log_interval = 10 # print every 10 steps
+log_interval = 10 # don't print too too often
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
-wandb_log = True # override via command line if you like
+wandb_log = True # WandB logging enabled
 wandb_project = 'shakespeare-char'
-wandb_run_name = 'baseline-mini-gpt'
+wandb_run_name = 'distributed-mini-gpt-sspp'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
@@ -32,6 +32,11 @@ beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
 warmup_iters = 100 # not super necessary potentially
 
+# DistributedGPT specific
+model_type = 'distributed_gpt'
+tp_size = 2  # Tensor parallel size
+block_types = ['spd','spd','parallel','parallel']  # SPD blocks for reduced communication  # None = all TP blocks. Try: ['spd']*6 or ['parallel']*6
+
 # on macbook also add
-device = 'mps'  # use Apple Silicon GPU
+device = 'mps'  
 compile = False # do not torch compile the model

@@ -436,8 +436,8 @@ class Parallel_Block(nn.Module):
         return z_i
     
     def forward(self, x):
-        if self.first_block:
-            x_rep = f_op.apply(x, self.TP_SIZE)
+        # If first block, expand input; otherwise input is already expanded
+        x_rep = f_op.apply(x, self.TP_SIZE) if self.first_block else x
         
         TP, _, _, _ = x_rep.size()
         assert TP == self.TP_SIZE
@@ -449,6 +449,7 @@ class Parallel_Block(nn.Module):
             z = g_op.apply(torch.stack(z_list, dim=0)) # Simulate All-Gather/
             return x + z
         
+        # Not last block: keep expanded form
         return x_rep + torch.stack(z_list, dim=0)
         
 class DistributedGPT(nn.Module):
