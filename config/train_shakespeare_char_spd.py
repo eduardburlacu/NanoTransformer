@@ -8,9 +8,9 @@ log_interval = 10
 
 always_save_checkpoint = False
 
-wandb_log = False
+wandb_log = True # WandB logging enabled
 wandb_project = 'shakespeare-char'
-wandb_run_name = 'mini-gpt'
+wandb_run_name = 'distributed-gpt-spd'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
