@@ -23,5 +23,5 @@ weight_decay = 1e-1
 # DistributedGPT specific
 model_type = 'distributed_gpt'
 tp_size = 2
-block_types = ['spd', 'parallel'] * 6  # Alternating: 6×(SPD+Parallel) = 6×1 + 2 boundary = 8 comms
+block_types = ['spd', 'spd', 'parallel', 'parallel' ] * 3  # 3*(1+1+0+1)=9 comms
 compile = False
