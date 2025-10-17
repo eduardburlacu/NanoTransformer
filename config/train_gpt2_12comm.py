@@ -3,7 +3,7 @@
 
 wandb_log = True
 wandb_project = 'gpt2'
-wandb_run_name = 'gpt2-spd-12comm'
+wandb_run_name = 'gpt2-12xs-12comm'
 
 batch_size = 12
 block_size = 1024

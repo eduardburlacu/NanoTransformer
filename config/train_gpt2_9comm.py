@@ -3,11 +3,11 @@
 
 wandb_log = True
 wandb_project = 'owt'
-wandb_run_name = 'gpt2-124M-8comm'
+wandb_run_name = 'gpt2-3xspps-9comm'
 
 batch_size = 12
 block_size = 1024
-gradient_accumulation_steps = 64 #5 * 8
+gradient_accumulation_steps = 5 * 8
 
 # 20k step experiment (vs 600k for full training)
 max_iters = 20000
@@ -23,5 +23,5 @@ weight_decay = 1e-1
 # DistributedGPT specific
 model_type = 'distributed_gpt'
 tp_size = 2
-block_types = ['spd', 'spd', 'parallel', 'parallel' ] * 3  # 3*(1+1+0+1)=9 comms
+block_types = ['spd', 'parallel', 'parallel', 'spd' ] * 3  # 3*(1+1+0+1)=9 comms
 compile = False

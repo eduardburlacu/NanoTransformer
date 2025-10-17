@@ -3,11 +3,11 @@
 
 wandb_log = True
 wandb_project = 'owt'
-wandb_run_name = 'gpt2-124M-18comm'
+wandb_run_name = 'gpt2-6xts-18comm'
 
 batch_size = 12
 block_size = 1024
-gradient_accumulation_steps = 64 #5 * 8
+gradient_accumulation_steps = 5*8 #5 * 8
 
 # 20k step experiment (vs 600k for full training)
 max_iters = 20000
