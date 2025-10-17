@@ -2,14 +2,14 @@
 # All TP blocks: 2 comms/layer × 12 layers = 24 total
 
 wandb_log = True
-wandb_project = 'owt'
-wandb_run_name = 'gpt2-124M-24comm'
+wandb_project = 'gpt2'
+wandb_run_name = 'gpt2-124M-tp-24comm'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 batch_size = 12
 block_size = 1024
-gradient_accumulation_steps = 5 * 8
+gradient_accumulation_steps = 64 #5 * 8
 
 # 20k step experiment (vs 600k for full training)
 max_iters = 20000

@@ -2,7 +2,7 @@
 # same as train_gpt2.py but with DistributedGPT
 
 wandb_log = True
-wandb_project = 'owt'
+wandb_project = 'gpt2'
 wandb_run_name='gpt2-124M'
 
 # these make the total batch size be ~0.5M
