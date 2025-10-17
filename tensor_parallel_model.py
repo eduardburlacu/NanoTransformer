@@ -317,9 +317,11 @@ class SPD_Block(nn.Module):
         return z_i
     
     def forward(self, x):
+        x_rep = f_op.apply(x, self.TP_SIZE)
         z_list = []
+
         for i in range(self.TP_SIZE):
-            z_list.append(self.forward_worker(x, i))
+            z_list.append(self.forward_worker(x_rep[i], i))
         
         z = x + g_op.apply(torch.stack(z_list, dim=0)) # [B, T, C]
         
@@ -329,6 +331,124 @@ class SPD_Block(nn.Module):
         if self.c_proj_attn_bias is not None:
             z += self.c_proj_attn_bias
         return z
+
+class Parallel_Block(nn.Module):
+    """ The SPD version of Tensor Parallel Transformer Block """
+    def __init__(self, config, first_block:bool=False, last_block:bool=False):
+        super().__init__()
+        self.first_block = first_block
+        self.last_block = last_block
+        assert config.n_embd % config.TP_SIZE == 0, "n_embd must be divisible by TP_SIZE"
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+
+        # Attention
+        assert config.n_embd % config.n_head == 0
+        self.TP_SIZE = config.TP_SIZE
+        assert config.n_head % config.TP_SIZE == 0, "n_head must be divisible by TP_SIZE"
+        self.heads_per_worker = config.n_head // config.TP_SIZE
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout_attn = config.dropout
+        
+        # 1. c_attn (COLUMNS PARALLEL)
+        c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_attn.weight.data, self.TP_SIZE, dim=0))
+        if config.bias:
+            self.c_attn_biases = nn.ParameterList(nn.Parameter(b) for b in torch.chunk(c_attn.bias.data, self.TP_SIZE, dim=0))
+        else:
+            self.c_attn_biases = [None] * self.TP_SIZE
+        del c_attn
+        
+        # 2. c_proj (ROW PARALLEL): Split along the INPUT dimension (n_embd)
+        c_proj_attn = nn.Linear(config.n_embd, config.n_embd, bias=None)
+        self.c_proj_attn_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_proj_attn.weight.data, self.TP_SIZE, dim=1))
+        self.c_proj_attn_bias = None
+        del c_proj_attn
+
+        # 3. Non-parallel components (standard)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # Causal mask registration
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+        # MLP
+        c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc_weights = nn.ParameterList(nn.Parameter(w) for w in torch.chunk(c_fc.weight.data, config.TP_SIZE, dim=0))
+        if config.bias:
+            self.c_fc_biases = nn.ParameterList(nn.Parameter(b) for b in torch.chunk(c_fc.bias.data, config.TP_SIZE, dim=0))
+        else:
+            self.c_fc_biases = [None] * config.TP_SIZE
+        del c_fc
+        c_proj_mlp  = nn.Linear(4 * config.n_embd, config.n_embd, bias=None)
+        self.c_proj_mlp_weights = nn.ParameterList(
+            nn.Parameter(w) for w in torch.chunk(c_proj_mlp.weight.data, config.TP_SIZE, dim=1)
+        )
+        self.c_proj_mlp_bias = None
+        del c_proj_mlp
+
+        self.dropout_mlp = nn.Dropout(config.dropout)
+
+    def forward_worker(self, x:torch.Tensor, i:int)->torch.Tensor:
+        assert 0 <= i < self.TP_SIZE
+        
+        # Attention
+        B, T, C = x.size()
+        qkv_i = F.linear(self.ln_1(x), self.c_attn_weights[i], self.c_attn_biases[i])
+        q_i, k_i, v_i = qkv_i.split(self.n_embd // self.TP_SIZE, dim=2)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        dim_per_worker = C //  self.n_head
+        k_i = k_i.view(B, T, self.heads_per_worker, dim_per_worker).transpose(1, 2)
+        q_i = q_i.view(B, T, self.heads_per_worker, dim_per_worker).transpose(1, 2)
+        v_i = v_i.view(B, T, self.heads_per_worker, dim_per_worker).transpose(1, 2)
+
+        if self.flash:
+            p_i = F.scaled_dot_product_attention(
+                q_i, k_i, v_i, attn_mask=None, 
+                dropout_p=self.dropout_attn if self.training else 0,
+                is_causal=True
+            )
+        
+        else:
+            att_i = (q_i @ k_i.transpose(-2, -1)) * (1.0 / math.sqrt(k_i.size(-1)))
+            att_i = att_i.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att_i = F.softmax(att_i, dim=-1)
+            att_i = self.attn_dropout(att_i)
+            p_i = att_i @ v_i
+
+        p_i = p_i.transpose(1, 2).contiguous().view(B, T, C // self.TP_SIZE)
+        p_i = F.linear(p_i, self.c_proj_attn_weights[i], None)
+        y_i = p_i + self.c_proj_attn_bias if self.c_proj_attn_bias is not None else p_i
+        y_i += x
+        
+        # MLP
+        z_i = F.linear(self.ln_2(y_i), self.c_fc_weights[i], self.c_fc_biases[i])
+        z_i = F.gelu(z_i)
+        z_i = F.linear(z_i, self.c_proj_mlp_weights[i], None)
+        z_i += p_i
+        return z_i
+    
+    def forward(self, x):
+        if self.first_block:
+            x = f_op.apply(x, self.TP_SIZE)
+        
+        TP, B, T, C = x.size()
+        assert TP == self.TP_SIZE
+        z_list = []
+        for i in range(self.TP_SIZE):
+            z_list.append(self.forward_worker(x[i], i))
+
+        if self.last_block:
+            z = g_op.apply(torch.stack(z_list, dim=0)) # Simulate All-Gather/
+            return x[0] + z
+        
+        return x + torch.stack(z_list, dim=0)
+        
 
 
 class DistributedGPT(nn.Module):
@@ -565,6 +685,13 @@ if __name__ == '__main__':
     print("all good")
     spd = SPD_Block(cfg)
     y = spd(x)
+    loss = F.mse_loss(y, x)
+    print("loss:", loss.item())
+    loss.backward()
+    print("all good")
+    x = torch.randn(bsz, cfg.block_size, cfg.n_embd)
+    parallel = Parallel_Block(cfg, first_block=True, last_block=True)
+    y = parallel(x)
     loss = F.mse_loss(y, x)
     print("loss:", loss.item())
     loss.backward()
